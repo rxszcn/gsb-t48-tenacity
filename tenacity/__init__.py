@@ -17,6 +17,7 @@
 # limitations under the License.
 import dataclasses
 import functools
+import inspect
 import sys
 import threading
 import time
@@ -404,6 +405,74 @@ class BaseRetrying(ABC):
 
         return t.cast("_RetryDecorated[P, R]", wrapped_f)
 
+    def _wrap_generator(self, f: t.Callable[P, R]) -> "_RetryDecorated[P, R]":
+        """Wrap a generator function for retrying.
+
+        The retry protocol only covers producing the first value: each
+        attempt calls the original function for a fresh generator and pulls
+        once (pulling an empty generator to exhaustion counts as a success).
+        Once the first value has been handed to the consumer, exceptions
+        raised by later pulls are re-raised as-is.
+        """
+
+        @functools.wraps(
+            f, functools.WRAPPER_ASSIGNMENTS + ("__defaults__", "__kwdefaults__")
+        )
+        def wrapped_gen(*args: t.Any, **kw: t.Any) -> t.Any:
+            if not self.enabled:
+                yield from f(*args, **kw)
+                return
+            # Always create a copy to prevent overwriting the local contexts when
+            # calling the same wrapped functions multiple times in the same stack
+            copy = self.copy()
+            # Reuse the same statistics dict rather than rebinding the attribute
+            # so that the stats stay visible through additional decorators that
+            # copy attributes via functools.wraps (which copies the reference to
+            # this dict into the outer wrapper's __dict__). See issue #519.
+            stats = wrapped_gen.statistics  # type: ignore[attr-defined]
+            stats.clear()
+            copy._local.statistics = stats  # noqa: SLF001
+            self._local.statistics = stats
+
+            copy.begin()
+            retry_state = RetryCallState(
+                retry_object=copy, fn=f, args=args, kwargs=kw
+            )
+            holder: dict[str, t.Any] = {}
+            while True:
+                do = copy.iter(retry_state=retry_state)
+                if isinstance(do, DoAttempt):
+                    try:
+                        gen = f(*args, **kw)
+                        holder["gen"] = gen
+                        first = next(gen)
+                    except StopIteration:
+                        retry_state.set_result(NO_RESULT)
+                    except BaseException:
+                        retry_state.set_exception(sys.exc_info())  # type: ignore[arg-type]
+                    else:
+                        retry_state.set_result(first)
+                elif isinstance(do, DoSleep):
+                    retry_state.prepare_for_next_attempt()
+                    copy.sleep(do)
+                else:
+                    first = do
+                    break
+            if first is NO_RESULT:
+                return
+            yield first
+            yield from holder["gen"]
+
+        def retry_with(*args: t.Any, **kwargs: t.Any) -> "_RetryDecorated[P, R]":
+            return self.copy(*args, **kwargs).wraps(f)
+
+        # Preserve attributes
+        wrapped_gen.retry = self  # type: ignore[attr-defined]
+        wrapped_gen.retry_with = retry_with  # type: ignore[attr-defined]
+        wrapped_gen.statistics = {}  # type: ignore[attr-defined]
+
+        return t.cast("_RetryDecorated[P, R]", wrapped_gen)
+
     def begin(self) -> None:
         self.statistics.clear()
         self.statistics["start_time"] = time.monotonic()
@@ -530,6 +599,12 @@ class BaseRetrying(ABC):
 
 class Retrying(BaseRetrying):
     """Retrying controller."""
+
+    @override
+    def wraps(self, f: t.Callable[P, R]) -> "_RetryDecorated[P, R]":
+        if inspect.isgeneratorfunction(f):
+            return self._wrap_generator(f)
+        return super().wraps(f)
 
     @override
     def __call__(
@@ -787,8 +862,10 @@ def retry(*dargs: t.Any, **dkw: t.Any) -> t.Any:
             )
         r: BaseRetrying
         sleep = dkw.get("sleep")
-        if _utils.is_coroutine_callable(f) or (
-            sleep is not None and _utils.is_coroutine_callable(sleep)
+        if (
+            _utils.is_coroutine_callable(f)
+            or inspect.isasyncgenfunction(f)
+            or (sleep is not None and _utils.is_coroutine_callable(sleep))
         ):
             r = AsyncRetrying(*dargs, **dkw)
         elif (

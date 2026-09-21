@@ -16,11 +16,13 @@
 # limitations under the License.
 
 import functools
+import inspect
 import sys
 import typing as t
 
 import tenacity
 from tenacity import (
+    NO_RESULT,
     AttemptManager,
     BaseRetrying,
     DoAttempt,
@@ -214,6 +216,8 @@ class AsyncRetrying(BaseRetrying):
 
     @override
     def wraps(self, fn: t.Callable[P, R]) -> _RetryDecorated[P, R]:
+        if inspect.isasyncgenfunction(fn):
+            return self._wrap_async_generator(fn)
         wrapped = super().wraps(fn)
         # Ensure wrapper is recognized as a coroutine function.
 
@@ -242,6 +246,76 @@ class AsyncRetrying(BaseRetrying):
         async_wrapped.statistics = {}  # type: ignore[attr-defined]
 
         return t.cast("_RetryDecorated[P, R]", async_wrapped)
+
+    def _wrap_async_generator(self, fn: t.Callable[P, R]) -> _RetryDecorated[P, R]:
+        """Wrap an async generator function for retrying.
+
+        The retry protocol only covers producing the first value: each
+        attempt calls the original function for a fresh async generator and
+        pulls once (pulling an empty async generator to exhaustion counts as
+        a success). Once the first value has been handed to the consumer,
+        exceptions raised by later pulls are re-raised as-is.
+        """
+
+        @functools.wraps(
+            fn, functools.WRAPPER_ASSIGNMENTS + ("__defaults__", "__kwdefaults__")
+        )
+        async def async_gen_wrapped(*args: t.Any, **kwargs: t.Any) -> t.Any:
+            if not self.enabled:
+                async for item in fn(*args, **kwargs):
+                    yield item
+                return
+            # Always create a copy to prevent overwriting the local contexts when
+            # calling the same wrapped functions multiple times in the same stack
+            copy = self.copy()
+            # Reuse the same statistics dict rather than rebinding the attribute
+            # so that the stats stay visible through additional decorators that
+            # copy attributes via functools.wraps (which copies the reference to
+            # this dict into the outer wrapper's __dict__). See issue #519.
+            stats = async_gen_wrapped.statistics  # type: ignore[attr-defined]
+            stats.clear()
+            copy._local.statistics = stats  # noqa: SLF001
+            self._local.statistics = stats
+
+            copy.begin()
+            retry_state = RetryCallState(
+                retry_object=copy, fn=fn, args=args, kwargs=kwargs
+            )
+            holder: dict[str, t.Any] = {}
+            while True:
+                do = await copy.iter(retry_state=retry_state)
+                if isinstance(do, DoAttempt):
+                    try:
+                        agen = fn(*args, **kwargs)
+                        holder["agen"] = agen
+                        first = await agen.__anext__()
+                    except StopAsyncIteration:
+                        retry_state.set_result(NO_RESULT)
+                    except BaseException:
+                        retry_state.set_exception(sys.exc_info())  # type: ignore[arg-type]
+                    else:
+                        retry_state.set_result(first)
+                elif isinstance(do, DoSleep):
+                    retry_state.prepare_for_next_attempt()
+                    await copy.sleep(do)  # type: ignore[misc]
+                else:
+                    first = do
+                    break
+            if first is NO_RESULT:
+                return
+            yield first
+            async for item in holder["agen"]:
+                yield item
+
+        def retry_with(*args: t.Any, **kwargs: t.Any) -> _RetryDecorated[P, R]:
+            return self.copy(*args, **kwargs).wraps(fn)
+
+        # Preserve attributes
+        async_gen_wrapped.retry = self  # type: ignore[attr-defined]
+        async_gen_wrapped.retry_with = retry_with  # type: ignore[attr-defined]
+        async_gen_wrapped.statistics = {}  # type: ignore[attr-defined]
+
+        return t.cast("_RetryDecorated[P, R]", async_gen_wrapped)
 
 
 __all__ = [
