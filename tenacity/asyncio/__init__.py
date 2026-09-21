@@ -214,6 +214,9 @@ class AsyncRetrying(BaseRetrying):
 
     @override
     def wraps(self, fn: t.Callable[P, R]) -> _RetryDecorated[P, R]:
+        if _utils.is_async_generator_callable(fn):
+            return self._wrap_async_generator(fn)
+
         wrapped = super().wraps(fn)
         # Ensure wrapper is recognized as a coroutine function.
 
@@ -242,6 +245,66 @@ class AsyncRetrying(BaseRetrying):
         async_wrapped.statistics = {}  # type: ignore[attr-defined]
 
         return t.cast("_RetryDecorated[P, R]", async_wrapped)
+
+    def _wrap_async_generator(self, fn: t.Callable[P, R]) -> _RetryDecorated[P, R]:
+        """Wrap an async generator function for retrying.
+
+        The retry protocol only covers producing the first value: each
+        attempt calls the original function for a fresh async generator and
+        pulls until the first item (or exhaustion, which counts as success).
+        Once the first value has been handed to the consumer, later failures
+        propagate untouched. Waiting happens inside the event loop.
+        """
+
+        @functools.wraps(
+            fn, functools.WRAPPER_ASSIGNMENTS + ("__defaults__", "__kwdefaults__")
+        )
+        async def async_gen_wrapped(*args: t.Any, **kwargs: t.Any) -> t.Any:
+            if not self.enabled:
+                async for value in fn(*args, **kwargs):  # type: ignore[misc]
+                    yield value
+                return
+            # Always create a copy to prevent overwriting the local contexts when
+            # calling the same wrapped functions multiple times in the same stack
+            copy = self.copy()
+            # Reuse the same statistics dict rather than rebinding the attribute
+            # so that the stats stay visible through additional decorators that
+            # copy attributes via functools.wraps (which copies the reference to
+            # this dict into the outer wrapper's __dict__). See issue #519.
+            stats = async_gen_wrapped.statistics  # type: ignore[attr-defined]
+            stats.clear()
+            copy._local.statistics = stats  # noqa: SLF001
+            self._local.statistics = stats
+
+            state: dict[str, t.Any] = {}
+
+            @functools.wraps(fn)
+            async def pull_first() -> None:
+                agen = fn(*args, **kwargs)  # type: ignore[misc]
+                state["agen"] = agen
+                try:
+                    state["first"] = await agen.__anext__()
+                except StopAsyncIteration:
+                    state["empty"] = True
+                else:
+                    state["empty"] = False
+
+            await copy(pull_first)  # type: ignore[type-var]
+            if state.get("empty", True):
+                return
+            yield state["first"]
+            async for value in state["agen"]:
+                yield value
+
+        def retry_with(*args: t.Any, **kwargs: t.Any) -> _RetryDecorated[P, R]:
+            return self.copy(*args, **kwargs).wraps(fn)
+
+        # Preserve attributes
+        async_gen_wrapped.retry = self  # type: ignore[attr-defined]
+        async_gen_wrapped.retry_with = retry_with  # type: ignore[attr-defined]
+        async_gen_wrapped.statistics = {}  # type: ignore[attr-defined]
+
+        return t.cast("_RetryDecorated[P, R]", async_gen_wrapped)
 
 
 __all__ = [

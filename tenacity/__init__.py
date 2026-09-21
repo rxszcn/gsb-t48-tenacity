@@ -374,6 +374,8 @@ class BaseRetrying(ABC):
 
         :param f: A function to wrap for retrying.
         """
+        if _utils.is_generator_callable(f):
+            return self._wrap_generator(f)
 
         @functools.wraps(
             f, functools.WRAPPER_ASSIGNMENTS + ("__defaults__", "__kwdefaults__")
@@ -393,6 +395,64 @@ class BaseRetrying(ABC):
             copy._local.statistics = stats  # noqa: SLF001
             self._local.statistics = stats
             return copy(f, *args, **kw)
+
+        def retry_with(*args: t.Any, **kwargs: t.Any) -> "_RetryDecorated[P, R]":
+            return self.copy(*args, **kwargs).wraps(f)
+
+        # Preserve attributes
+        wrapped_f.retry = self  # type: ignore[attr-defined]
+        wrapped_f.retry_with = retry_with  # type: ignore[attr-defined]
+        wrapped_f.statistics = {}  # type: ignore[attr-defined]
+
+        return t.cast("_RetryDecorated[P, R]", wrapped_f)
+
+    def _wrap_generator(self, f: t.Callable[P, R]) -> "_RetryDecorated[P, R]":
+        """Wrap a generator function for retrying.
+
+        The retry protocol only covers producing the first value: each
+        attempt calls the original function for a fresh generator and pulls
+        until the first item (or exhaustion, which counts as success). Once
+        the first value has been handed to the consumer, later failures
+        propagate untouched.
+        """
+
+        @functools.wraps(
+            f, functools.WRAPPER_ASSIGNMENTS + ("__defaults__", "__kwdefaults__")
+        )
+        def wrapped_f(*args: t.Any, **kw: t.Any) -> t.Any:
+            if not self.enabled:
+                yield from f(*args, **kw)
+                return
+            # Always create a copy to prevent overwriting the local contexts when
+            # calling the same wrapped functions multiple times in the same stack
+            copy = self.copy()
+            # Reuse the same statistics dict rather than rebinding the attribute
+            # so that the stats stay visible through additional decorators that
+            # copy attributes via functools.wraps (which copies the reference to
+            # this dict into the outer wrapper's __dict__). See issue #519.
+            stats = wrapped_f.statistics  # type: ignore[attr-defined]
+            stats.clear()
+            copy._local.statistics = stats  # noqa: SLF001
+            self._local.statistics = stats
+
+            state: dict[str, t.Any] = {}
+
+            @functools.wraps(f)
+            def pull_first() -> None:
+                gen = f(*args, **kw)
+                state["gen"] = gen
+                try:
+                    state["first"] = next(gen)
+                except StopIteration:
+                    state["empty"] = True
+                else:
+                    state["empty"] = False
+
+            copy(pull_first)
+            if state.get("empty", True):
+                return
+            yield state["first"]
+            yield from state["gen"]
 
         def retry_with(*args: t.Any, **kwargs: t.Any) -> "_RetryDecorated[P, R]":
             return self.copy(*args, **kwargs).wraps(f)
@@ -787,8 +847,10 @@ def retry(*dargs: t.Any, **dkw: t.Any) -> t.Any:
             )
         r: BaseRetrying
         sleep = dkw.get("sleep")
-        if _utils.is_coroutine_callable(f) or (
-            sleep is not None and _utils.is_coroutine_callable(sleep)
+        if (
+            _utils.is_coroutine_callable(f)
+            or _utils.is_async_generator_callable(f)
+            or (sleep is not None and _utils.is_coroutine_callable(sleep))
         ):
             r = AsyncRetrying(*dargs, **dkw)
         elif (
